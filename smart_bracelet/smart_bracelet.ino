@@ -2,6 +2,34 @@
 #include "Wire.h"
 #include "MAX30105.h"
 #include "spo2_algorithm.h"
+#include <ArduinoBLE.h>
+
+BLEService serviceBracelet("180A"/*"1840"*/);  //UUID para el servicio de "Generic Health Sensor Service"
+
+// PPG - personalizado
+BLECharacteristic ppgChar("d44f8caa-fffb-4eb1-b733-7e5511d4ef1c", BLENotify, 4);  // 4 bytes o según necesites
+
+// HR - estándar BLE
+BLECharacteristic hrChar("2A37", BLENotify, 2);  // 2 bytes: frecuencia cardíaca
+
+// Presencia - personalizado
+BLECharacteristic presenceChar("2AE2", BLENotify, 1);  // 1 byte booleano
+
+// Temperatura - estándar
+BLECharacteristic tempChar("2A6E", BLENotify, 2);  // 2 bytes float o int16_t si usas 0.01°C
+
+// SPO2 - personalizado
+BLECharacteristic spo2Char("8b6ff090-c1a1-42e9-a4b9-3eefc6530c4b", BLENotify, 2);
+
+// Acelerómetro (X, Y, Z) - personalizado
+BLECharacteristic accChar("ad0c0caa-3d8c-4b59-a091-b3389da3a0df", BLENotify, 4);
+
+// Giroscopio (X, Y, Z) - personalizado
+BLECharacteristic gyrChar("5da304df-e10c-4270-92da-75487e95094a", BLENotify, 4);
+
+// Señal de inicio
+BLECharacteristic startChar("f37ac038-0c83-4f93-9bfa-109ec42d1c35", BLENotify, 1); // 1 byte: 1 cuando se pulsa
+
 
 // Pines
 const int buttonPin = D3;
@@ -25,10 +53,11 @@ int8_t validSPO2, validHeartRate;
 // Variables control estado
 bool samplingActive = false;
 unsigned long samplingStartTime = 0;
-const unsigned long samplingDuration = 20000; // 20 segundos
+const unsigned long samplingDuration = 20000;  // 20 segundos
 
 void setup() {
   Serial.begin(9600);
+  delay(2000);  // Esperar a que Serial esté listo
 
   pinMode(buttonPin, INPUT_PULLUP);
 
@@ -47,82 +76,129 @@ void setup() {
     Serial.println("MAX30105 no detectado. Verifica conexión.");
     while (1);
   }
+  Serial.println("MAX30105 iniciado correctamente.");
 
-  particleSensor.setup(0x1F, 2, 3, 100, 411, 4096); // configuración avanzada
+
+  particleSensor.setup(0x1F, 2, 3, 100, 411, 4096);  // configuración avanzada
   particleSensor.enableDIETEMPRDY();
 
   if (myIMU.begin() != 0) {
     Serial.println("Fallo al inicializar LSM6DS3.");
   }
+  Serial.println("LSM6DS3 iniciado correctamente.");
+
+  if (!BLE.begin()) {
+    Serial.println("Fallo al iniciar BLE");
+  }
+  Serial.println("BLE iniciado correctamente.");
+
+  BLE.setLocalName("UTP+ Salud - Brazalete");
+  BLE.setAdvertisedService(serviceBracelet);
+
+  serviceBracelet.addCharacteristic(ppgChar);
+  serviceBracelet.addCharacteristic(hrChar);
+  serviceBracelet.addCharacteristic(spo2Char);
+  serviceBracelet.addCharacteristic(presenceChar);
+  serviceBracelet.addCharacteristic(tempChar);
+  serviceBracelet.addCharacteristic(accChar);
+  serviceBracelet.addCharacteristic(gyrChar);
+  serviceBracelet.addCharacteristic(startChar);
+
+  BLE.addService(serviceBracelet);
+  BLE.advertise();
 }
 
 void loop() {
-  static bool lastButtonState = HIGH;
-  bool currentButtonState = digitalRead(buttonPin);
+  BLEDevice central = BLE.central();  // crea un objeto central para recibir datos
 
-  if (lastButtonState == HIGH && currentButtonState == LOW && !samplingActive) {
-    // Botón presionado y no estamos muestreando: iniciar cuenta regresiva
-    countdownAndStartSampling();
-  }
-  lastButtonState = currentButtonState;
+  if (central) {                            // si se conecta un central
+    Serial.print("Conectado a central: ");  // muestra texto por monitor serie
+    Serial.println(central.address());      // muestra direccion del central conectado
+    digitalWrite(LED_BUILTIN, HIGH);        // enciende LED 
 
-  if (samplingActive) {
-    unsigned long elapsed = millis() - samplingStartTime;
+    while (central.connected()) {
+      static bool lastButtonState = HIGH;
+      bool currentButtonState = digitalRead(buttonPin);
 
-    if (elapsed < samplingDuration) {
-      // Leer IR para presencia
-      long ir = particleSensor.getIR();
-      long red = particleSensor.getRed();
-      bool presence = (ir > 50000);
+      if (lastButtonState == HIGH && currentButtonState == LOW && !samplingActive) {
+        // Botón presionado y no estamos muestreando: iniciar cuenta regresiva
+        countdownAndStartSampling();
 
-      if (presence) {
-        // Parpadear LED imitando latido
-        blinkLedWithHeartBeat(elapsed);
-
-        // Imprimir datos en tiempo real mientras haya presencia
-        data1 = getHeartBeat(ir) + " " +
-                      getPresence(ir) + " " +
-                      getTemperature() + " " +
-                      getAcceleration() + " " +
-                      getGyroscope();
-
-        Serial.println(data1);
-
-        // Guardar muestras para HR y SpO2
-        static uint8_t sampleCount = 0;
-        if (sampleCount < 100) {
-          irBuffer[sampleCount] = ir;
-          redBuffer[sampleCount] = red;
-          sampleCount++;
-        }
-      } else {
-        Serial.println("PR:0 - Presencia perdida, interrumpiendo muestreo.");
-        samplingActive = false;
-        digitalWrite(ledAzul, HIGH);
-        digitalWrite(ledRojo, LOW);
-        delay(500);
-        digitalWrite(ledRojo, HIGH);
+        // Señal de inicio: enviar 1
+        startChar.writeValue((byte)1);
       }
-    } else {
-      // Tiempo cumplido, procesar HR y SpO2
-      processAndPrintHRSpO2();
-      samplingActive = false;
-      digitalWrite(ledAzul, HIGH);
-      Serial.println(data2);
-      Serial.println("Muestreo finalizado. Esperando próximo botón...");
-      digitalWrite(ledVerde, LOW);
-      delay(400);
-      digitalWrite(ledVerde, HIGH);
-      delay(100);
-      digitalWrite(ledVerde, LOW);
-      delay(400);
-      digitalWrite(ledVerde, HIGH);
-    }
-  }
+      lastButtonState = currentButtonState;
 
+      if (samplingActive) {
+        unsigned long elapsed = millis() - samplingStartTime;
+
+        if (elapsed < samplingDuration) {
+          // Leer IR para presencia
+          long ir = particleSensor.getIR();
+          long red = particleSensor.getRed();
+          bool presence = (ir > 50000);
+
+          if (presence) {
+            // Parpadear LED imitando latido
+            blinkLedWithHeartBeat(elapsed);
+
+            ppgChar.writeValue(String(getHeartBeat(ir)).c_str());
+            presenceChar.writeValue(String(getPresence(ir)).c_str());
+            tempChar.writeValue(String(getTemperature()).c_str());
+            accChar.writeValue(getAcceleration().c_str());
+            gyrChar.writeValue(getGyroscope().c_str());
+
+            Serial.print(getHeartBeat(ir) + " ");
+            Serial.print(getPresence(ir) + " ");
+            Serial.print(String(getTemperature()) + " ");
+            Serial.print(getAcceleration() + " ");
+            Serial.print(getGyroscope() + " ");
+
+            // Guardar muestras para HR y SpO2
+            static uint8_t sampleCount = 0;
+            if (sampleCount < 100) {
+              irBuffer[sampleCount] = ir;
+              redBuffer[sampleCount] = red;
+              sampleCount++;
+            }
+          } else {
+            Serial.println("PR:0 - Presencia perdida, interrumpiendo muestreo.");
+            samplingActive = false;
+            digitalWrite(ledAzul, HIGH);
+            digitalWrite(ledRojo, LOW);
+            delay(500);
+            digitalWrite(ledRojo, HIGH);
+          }
+        } else {
+          // Tiempo cumplido, procesar HR y SpO2
+          processAndPrintHRSpO2();
+          samplingActive = false;
+          digitalWrite(ledAzul, HIGH);
+
+          hrChar.writeValue((int32_t)heartRate);
+          spo2Char.writeValue((int32_t)spo2);
+
+          Serial.print(heartRate + " ");
+          Serial.print(spo2 + " ");
+
+          Serial.println("Muestreo finalizado. Esperando próximo botón...");
+          digitalWrite(ledVerde, LOW);
+          delay(400);
+          digitalWrite(ledVerde, HIGH);
+          delay(100);
+          digitalWrite(ledVerde, LOW);
+          delay(400);
+          digitalWrite(ledVerde, HIGH);
+        }
+      }
+    }
+    Serial.print("Desconectado de central: ");  // muestra texto al desconectarse el central
+    Serial.println(central.address());
+    startChar.writeValue((byte)0);  // Reinicio señal
+    BLE.advertise(); // <-- REANUDA PUBLICIDAD
+  }
   delay(50);
 }
-
 // ================= FUNCIONES =================
 
 void countdownAndStartSampling() {
@@ -155,7 +231,7 @@ void blinkLedWithHeartBeat(unsigned long elapsed) {
   // Simula latido: LED ON ~200ms cada latido, latidos ~60-100 bpm (1 latido ~600-1000ms)
   // Aquí usamos HR estimado si válido, sino latido fijo a 75 bpm (800ms ciclo)
   int bpm = (validHeartRate > 30 && validHeartRate < 180) ? validHeartRate : 75;
-  unsigned long beatPeriod = 60000UL / bpm; // ms por latido
+  unsigned long beatPeriod = 60000UL / bpm;  // ms por latido
   unsigned long timeInCycle = elapsed % beatPeriod;
 
   if (timeInCycle < 200) {
@@ -172,8 +248,8 @@ void processAndPrintHRSpO2() {
   for (byte i = 0; i < 100; i++) {
     // Esperar a que haya datos disponibles
     while (!particleSensor.available()) {
-      particleSensor.check(); // Actualiza el sensor
-      delay(5);               // Pequeña espera para no bloquear excesivo
+      particleSensor.check();  // Actualiza el sensor
+      delay(5);                // Pequeña espera para no bloquear excesivo
     }
     redBuffer[i] = particleSensor.getRed();
     irBuffer[i] = particleSensor.getIR();
@@ -184,40 +260,37 @@ void processAndPrintHRSpO2() {
   maxim_heart_rate_and_oxygen_saturation(
     irBuffer, 100, redBuffer,
     &spo2, &validSPO2,
-    &heartRate, &validHeartRate
-  );
+    &heartRate, &validHeartRate);
 
   // Validar resultados
   if (!validHeartRate) heartRate = 0;
   if (!validSPO2) spo2 = 0;
 
-  data2 = "HR: " + String(heartRate) + " " 
-          + "OX: " + String(spo2);
+  //data2 = "HR: " + String(heartRate) + " "
+  //        + "OX: " + String(spo2);
+
+
 }
 
 // ================= FUNCIONES SENSOR =================
 
-String getHeartBeat(long irValue) {
-  return "HB:" + String(irValue);
+long getHeartBeat(long irValue) {
+  return irValue;
 }
 
-String getPresence(long irValue) {
-  return String("PR:") + (irValue > 50000 ? "1" : "0");
+byte getPresence(long irValue) {
+  return irValue > 50000 ? 1 : 0;
 }
 
-String getTemperature() {
+float getTemperature() {
   float temp = particleSensor.readTemperature();
-  return "TMP:" + String(temp, 2);
+  return temp;
 }
 
 String getAcceleration() {
-  return "AX:" + String(myIMU.readFloatAccelX(), 2) + " " +
-         "AY:" + String(myIMU.readFloatAccelY(), 2) + " " +
-         "AZ:" + String(myIMU.readFloatAccelZ(), 2);
+  return String(myIMU.readFloatAccelX()) + ", " + String(myIMU.readFloatAccelY()) + ", " + String(myIMU.readFloatAccelY());
 }
 
 String getGyroscope() {
-  return "GX:" + String(myIMU.readFloatGyroX(), 2) + " " +
-         "GY:" + String(myIMU.readFloatGyroY(), 2) + " " +
-         "GZ:" + String(myIMU.readFloatGyroZ(), 2);
+  return String(myIMU.readFloatGyroX()) + ", " + String(myIMU.readFloatGyroY()) + ", " + String(myIMU.readFloatGyroZ());
 }
